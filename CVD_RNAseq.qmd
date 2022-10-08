@@ -1,0 +1,405 @@
+---
+title: "CVD_RNA_Seq"
+author: "Ashfaq Ali"
+format: html
+editor: visual
+---
+
+## Libraries and setup
+
+```{r}
+renv::activate()
+renv::install("tidyverse")
+renv::install("bioc::DESeq2")
+renv::install("bioc::biomaRt")
+```
+
+```{r}
+library(readr)
+library(tidyverse)
+(library(DESeq2))
+#library(gplots)
+```
+
+## Data Import
+
+### Count Matrix
+
+```{r}
+counts <- as.matrix(read.table(file = "raw_data/all.tsv", header = TRUE, sep = "\t", row.names = 1,  as.is = TRUE))
+
+samples <- colnames(counts) |> str_remove("Francesca.")
+
+colnames(counts) <- samples
+
+
+
+```
+
+### Pheno data
+
+```{r}
+sample_clin <- readxl::read_xlsx("../../Region.Skane.TTM1.Biobank_Chsoen_for_currentanalysis.xlsx")
+sample_clin$sample_id_rep <- str_replace_all(sample_clin$screening_number_old , "MMO", "MAL")
+sample_clin$sample_id_rep <- str_replace(sample_clin$sample_id_rep, "SEMM002" , "SEMAL002")
+sample_clin <- filter(sample_clin, sample_id_rep  %in% samples)
+rownames(sample_clin) <- sample_clin$sample_id_rep
+
+clin_vars <- c( "randomisation_code", "dead24",	"dead48",	"dead72","binarysecout180daycpcscore", "p_ca_to_rosc_min", "a_shock_on_admission", "shockable", "awakeday1",	"awakeday2",	"awakeday3", "deadatfollowup")
+
+sample_clin[, clin_vars] <- lapply(sample_clin[, clin_vars], as.factor) |> as.data.frame()
+
+```
+
+### Row Data
+
+```{r, eval=FALSE}
+# List marts
+mart=biomaRt::useMart(biomart="ensembl", dataset="hsapiens_gene_ensembl")
+
+# head(biomaRt::listDatasets(marts))
+# biomaRt::listMarts(host = "plants.ensembl.org")
+# 
+# 
+
+
+ Available_attributes <- biomaRt::listAttributes(mart, page = "feature_page")$name
+# head(biomaRt::keys(ensembl, keytype = "Gene stable ID"))
+# Available_attributes
+
+#write.csv(Available_attributes, "~/Documents/Projects/PotatoNGS/reults/Avaialable_annotations.csv", row.names = FALSE)
+
+values <- rownames(counts)
+
+## attributes are whatever you want tor retrieve from database
+annotations <- biomaRt::getBM(attributes = c( "ensembl_gene_id", "description", "gene_biotype", "protein_id", "hgnc_id",  "hgnc_symbol", "external_gene_name"  ), filters = "ensembl_gene_id", values = values, mart = mart, uniqueRows = FALSE)
+
+annotations$gene_id <- annotations$ensembl_transcript_id
+rownames(annotations) <- annotations$ensembl_transcript_id
+
+annotations2 <- annotations %>%
+  group_by(ensembl_gene_id) %>%
+  summarise(text=paste(protein_id,collapse=';'),
+            hgnc_id=unique(hgnc_id),
+            description =unique(description),
+            gene_biotype=unique( gene_biotype),
+            hgnc_symbol=unique(hgnc_symbol),
+            external_gene_name=unique(external_gene_name)
+            ) %>% ungroup()
+
+saveRDS(annotations, file = "./Results/row_annotations.rds")
+saveRDS(annotations2, file = "./Results/row_annotations_with_prteinID.rds")
+
+```
+
+```{r}
+annotations <- readRDS("./Results/row_annotations_with_prteinID.rds")
+```
+
+## Data objects
+
+```{r}
+se <- SummarizedExperiment::SummarizedExperiment(assays = list(counts = counts),
+    colData=sample_clin
+)
+
+
+idx1 <- rowMeans(assays(se)$counts) >= 10
+sef <- se[idx1,]
+
+saveRDS(se, "raw_data/full_data.rds")
+saveRDS(sef, "raw_data/filtered_data.rds")
+```
+
+## DeSeq Objects
+
+```{r}
+rownames(se)
+
+dds_cpc <- DESeqDataSet(sef , design = ~1+binarysecout180daycpcscore)
+dds_rc <- DESeq2::DESeqDataSet(sef , design = ~1+randomisation_code )
+dds_dead72 <- DESeq2::DESeqDataSet(sef , design = ~1 + dead72)
+dds_deadFUP <- DESeq2::DESeqDataSet(sef , design = ~ 1+ deadatfollowup)
+dds_shock <- DESeqDataSet(sef , design = ~1+shockable)
+dds_cpc_ran_int <- DESeqDataSet(sef , design = ~1+binarysecout180daycpcscore+randomisation_code+ binarysecout180daycpcscore*randomisation_code)
+
+
+
+```
+
+## DESeq analyses
+
+```{r}
+dds_cpc <- DESeq(dds_cpc, parallel = TRUE)
+dds_rc <- DESeq(dds_rc, parallel = TRUE)
+dds_dead72 <- DESeq(dds_dead72, parallel = TRUE)
+dds_deadFUP <- DESeq(dds_deadFUP, parallel = TRUE)
+dds_shock <- DESeq(dds_shock, parallel = TRUE)
+dds_cpc_ran_int <- DESeq(dds_cpc_ran_int, parallel = TRUE)
+```
+
+## Export DESeq results
+
+```{r}
+Results_RNAseq <- list()
+
+Results_RNAseq$cpc <- results(dds_cpc, name = "binarysecout180daycpcscore_1_vs_0", alpha = 0.01) %>%
+    as.data.frame() %>%
+    rownames_to_column(., var = "gene_id") %>%
+     arrange(padj)
+
+
+Results_RNAseq$cpc_rand_int <- results(dds_cpc_ran_int, name = "binarysecout180daycpcscore1.randomisation_code1", alpha = 0.01) %>%
+    as.data.frame() %>%
+    rownames_to_column(., var = "gene_id") %>%
+    arrange(padj) 
+
+
+Results_RNAseq$rand_cod <- results(dds_rc, name = "randomisation_code_1_vs_0", alpha = 0.01) %>%
+    as.data.frame() %>%
+    rownames_to_column(., var = "gene_id") %>%
+    arrange(padj)  
+Results_RNAseq$shock <- results(dds_shock, name = "shockable_1_vs_0", alpha = 0.01) %>%
+    as.data.frame() %>%
+    rownames_to_column(., var = "gene_id") %>%
+    arrange(padj) 
+
+Results_RNAseq$deadatfollowup <- results(dds_deadFUP, name = "deadatfollowup_1_vs_0", alpha = 0.01) %>%
+    as.data.frame() %>%
+    rownames_to_column(., var = "gene_id") %>%
+    arrange(padj)  
+
+
+ Results_RNAseq$dead72 <- results(dds_dead72, name = "dead72_1_vs_0", alpha = 0.01) %>%
+    as.data.frame() %>%
+    rownames_to_column(., var = "gene_id") %>%
+    arrange(padj) 
+
+ View(Results_RNAseq$cpc)
+ 
+ 
+ ## Save the results
+ ## 
+ writexl::write_xlsx(Results_RNAseq, "./Results/DE_results.xlsx")
+
+
+
+```
+
+## Annotate results
+
+```{r}
+
+res_all <- names(Results_RNAseq)
+
+annotations2$text <- NULL
+
+main_effects <- list()
+
+for (i in 1:length(res_all)) {
+  main_effects[[paste(res_all[i])]] <- left_join(Results_RNAseq[[i]],annotations2,
+      by = c("gene_id"="ensembl_gene_id") )
+    
+
+  # print(mcols(results(dds, name = res_all[i],  alpha = 0.05))$description)
+}
+writexl::write_xlsx(main_effects, "./Results/DE_results_annotated.xlsx")
+#names(main_effects) <- res_all
+saveRDS(main_effects, "./Results/Results.rds")
+
+```
+
+```{r}
+anno_2 <- annotations %>% group_by(ensembl_gene_id) %>%
+  summarise(test = toString(protein_id)) |> ungroup()
+
+join(anno_2, annotations, by ="ensembl_gene_id")
+
+aggregate(ensembl_gene_id ~ protein_id, data=annotations, FUN=paste)
+Results_RNAseq_ann <- list()
+Results_rand_v2[[batches[i]]] <- topTable(fit, p.value = 1, number = Inf, coef = "rand_cod", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "ID") %>%
+ # arrange(padj) %>%
+  left_join(rowData(data) |> as_tibble(),
+    {
+      .
+    },
+    by ="ID"
+  ) 
+}
+writexl::write_xlsx(Results_rand_v2, paste0("./Results/DE_results_rand_code_v2.xlsx"))
+saveRDS(Results_rand_v2, "./Results/DE_Results_rand_v2.rds")
+```
+
+## Volcano plots
+
+```{r}
+main_effects <- readRDS("./Results/Results.rds")
+
+
+  
+ev1 <- EnhancedVolcano::EnhancedVolcano(main_effects$dead72,
+  lab = main_effects$shock$hgnc_symbol,
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.01,
+  labSize = 2,
+  #ylim = c(0, max(-log10(Table$Condition_L8d_vs_Control$padj), na.rm = TRUE) + 1),
+  FCcutoff = 2,
+ # xlim = c(-2.5,2.5) , 
+   #legendLabels = c("Not significant", "", "adj. P val < 0.05", "adj Pval < 0.05 & effect size >/< 0.01"),
+# transcriptPointSize = 1.5,
+  title = "dead at 72h",
+  subtitle = "",
+  boxedLabels = FALSE,
+  shadeBins = 4,
+  legendLabSize = 10
+)
+ggsave(ev1, filename = "./Results/Figures/dead72_Volcanohock.png")
+## 
+```
+
+## PCA of samples and association with the clinical variables
+
+### PCA analyses
+
+```{r}
+se <- readRDS("raw_data/full_data.rds")
+sef <- readRDS("raw_data/filtered_data.rds")
+ddsef <- DESeqDataSet(sef , design = ~1)
+vst_data <- vst(ddsef)
+
+assays(sef)$vst <- assays(vst_data)[[1]]
+```
+
+```{r, eval = FALSE,include=FALSE,  echo = FALSE, fig.width=10, fig.height=18, warning = FALSE, message= FALSE}
+
+pcaobjl <- stats::prcomp(t(na.omit(assays(sef)$vst)), )
+
+percentVarl <- round(pcaobjl$sdev^2 / sum(pcaobjl$sdev^2),2)*100
+
+pcamatl1 <- as.data.frame(pcaobjl$x)
+pcamatl2 <- as.data.frame(merge(pcamatl1, colData(sef), by = 0))
+pcamatl2
+```
+
+### Plot sample overview using PCA
+
+```{r eval=FALSE, include=FALSE}
+plot.pca1 <- ggplot(pcamatl2, aes(PC1, PC2, color = binarysecout180daycpcscore, text = Row.names)) + 
+  geom_point(size=2, alpha = 0.9) + 
+  scale_colour_brewer(palette = "Set2") + 
+  xlab(paste("PC1: ", percentVarl[1], "% variance", sep="")) + 
+  ylab(paste("PC2: ", percentVarl[2], "% variance", sep="")) + 
+  theme_bw() + 
+   geom_text(
+    label=pcamatl2$randomisation_code, 
+    nudge_x = 1, nudge_y = 1, 
+    check_overlap = T
+  ) + 
+  ggtitle("PCA color indicating CPC category and lable indicating the randomization code") +
+  theme(legend.title = element_blank())
+
+#ggplotly(plot.pca12)
+
+ggsave(plot.pca1,
+  file = paste("./Results/Figures/",
+    "PCA_randcod_CPC", ".png",
+    sep = ""
+  ),
+  scale = 2,
+  units = "cm", height = 10, width = 15
+)
+randomisation_code
+
+plot.pca12 <- ggplot(pcamatl2, aes(PC1, PC2, color = shockable, text = Row.names)) + 
+  geom_point(size=2, alpha = 0.9) + 
+  scale_colour_brewer(palette = "Set2") + 
+  xlab(paste("PC1: ", percentVarl[1], "% variance", sep="")) + 
+  ylab(paste("PC2: ", percentVarl[2], "% variance", sep="")) + 
+  theme_bw() + 
+  geom_text(
+      label=pcamatl2$screening_number, 
+    nudge_x = 0.25, nudge_y = 0.25, 
+    check_overlap = T
+  ) +
+  ggtitle("PCA color indicating shockable vs.non. shockable heart") +
+  theme(legend.title = element_blank())
+plot.pca12  
+ggsave(plot.pca12,
+  file = paste("./Results/Figures/",
+    "PCA_shock", ".png",
+    sep = ""
+  ),
+  scale = 2,
+  units = "cm", height = 10, width = 15
+)
+
+
+plot.pca3 <- ggplot(pcamatl2, aes(PC1, PC2, color = deadatfollowup, text = Row.names)) + 
+  geom_point(size=2, alpha = 0.9) + 
+  scale_colour_brewer(palette = "Set2") + 
+  xlab(paste("PC1: ", percentVarl[1], "% variance", sep="")) + 
+  ylab(paste("PC2: ", percentVarl[2], "% variance", sep="")) + 
+  theme_bw() + 
+  geom_text(
+      label=pcamatl2$screening_number, 
+    nudge_x = 0.25, nudge_y = 0.25, 
+    check_overlap = T
+  ) +
+  ggtitle("PCA color death at follow up") +
+  theme(legend.title = element_blank())
+plot.pca3  
+ggsave(plot.pca12,
+  file = paste("./Results/Figures/",
+    "PCA_dead_folUp", ".png",
+    sep = ""
+  ),
+  scale = 2,
+  units = "cm", height = 10, width = 15
+)
+
+```
+
+## Explained variance by PCs
+
+This step calculates explained variance by each principle component of
+the protein data.
+
+```{r eval=FALSE, include=FALSE}
+png("../Results/Figures/PC_VariancePlot.png", units = "cm", height = 24, width = 20, res = 300)
+barplot(percentVarl[1:10] , ylab = "Percent varinace explained", xlab = "PC 1 to 10", main = "Percent variace explained by first 10 PCs (loess)", col = "purple")
+dev.off()
+```
+
+## Correlation of principle component with Phenotype data
+
+To identify the most relevant clinical variables associated with protein
+data, we calculate correlation between the principle components and the
+phenotype variables.
+
+```{r eval=FALSE, include=FALSE}
+
+clin_vars <- c( "randomisation_code",	"dead72","binarysecout180daycpcscore",  "shockable",  "deadatfollowup")
+pheno <- pcamatl2[ ,clin_vars]
+
+pc_adj_rsq_l <- matrix(NA, ncol = 10, nrow = dim(pheno)[2])
+
+for (i in 1:dim(pheno)[2]) {
+  pc_adj_rsq_l[i, ] <- apply(pcamatl2[, 2:11], 2, function(x) summary(lm(x ~ pheno[, i]), na.action=na.exclude)$adj.r.squared)
+}
+colnames(pc_adj_rsq_l) <- colnames(pcamatl2[, 2:11])
+rownames(pc_adj_rsq_l) <- colnames(pheno)
+
+
+png("./Results/Figures/PC_pheno_corr.png", units = "cm", height = 24, width = 20, res = 300)
+pheatmap::pheatmap(pc_adj_rsq_l, display_numbers = TRUE, fontsize = 12, cluster_cols = FALSE, main = "Adj R^2 of Association between PCs and clinical variables")
+dev.off()
+```
+
+## Heatmaps with the relevant variables
+
+## GSEA
+
+## Clustering?
